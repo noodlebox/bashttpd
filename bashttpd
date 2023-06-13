@@ -1,0 +1,331 @@
+#!/bin/bash
+# Usage:
+#   bashttpd -l [ -p PORT ] [ -r DOCROOT ]
+#     Begin listening for connections on PORT (default is 8080), fork new
+#     listener once connection is established.
+#   bashttpd -h
+#     Print this help text.
+#   bashttpd
+#     Handle an HTTP connection, with request coming from stdin and response
+#     going to stdout.
+
+PORT=8080
+LISTEN=false
+DOCROOT="$(pwd)"
+VERSION_BASHTTPD="1.0"
+VERSION_BASH="$(bash --version | sed -n -e '1s/^.*version \([^[:space:]]*\).*$/\1/p')"
+VERSION_NETCAT="$(nc -h 2>&1 | sed -n -e '1s/^\[v\(.*\)\]$/\1/p')"
+VERSION="$(basename $0)/${VERSION_BASHTTPD} bash/${VERSION_BASH} netcat/${VERSION_NETCAT}"
+# HTTP Response Codes
+R_200="200 OK :D"
+R_403="403 Forbidden :|"
+R_404="404 Not Found ;_;"
+# Parse options passed on command line
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-h|--help)
+			echo "Not yet implemented."
+			exit 0
+			;;
+		-l|--listen)
+			LISTEN=true
+			;;
+		-p|--port)
+			if [ -z "$2" ]; then
+				echo "Usage: -p|--port PORT" >&2
+				exit 1
+			fi
+			PORT="$2"
+			shift
+			;;
+		-r|--root)
+			if [ -z "$2" ]; then
+				echo "Usage: -r|--root DOCROOT" >&2
+				exit 1
+			fi
+			DOCROOT="$2"
+			shift
+			;;
+		*)
+			echo "Unknown parameter: \"$1\"" >&2
+			exit 1
+			;;
+	esac
+	shift
+done
+
+# Handle -l
+if $LISTEN; then
+	nc -v -l -p $PORT -e "$0" 2>&1 | while read line; do
+		if [[ $line == connect* ]]; then
+			$0 -l -p $PORT -r $DOCROOT &
+		elif [[ $line == Can* ]]; then
+			echo "Unable to bind to port $PORT" >&2
+			exit 1 
+		fi
+	done
+	exit 0
+fi
+
+###############################################################################
+# Stream filters... encoding, decoding, escaping, etc
+
+# URLENCODE - safe for use in URLs, understood by most web browsers ###########
+# raw --> urlencoded
+# od (GNU coreutils) Slowest :(
+# urlencode () { od -v -A n -t x1 | tr -d '\n' | tr ' ' '%' }
+# xxd (bundled with vim) Fastest by far (at least 10x faster, compared to od or hexdump)
+rawurlencode () { xxd -p -c 1 | head -c -1 | { echo -n '%'; tr '\n' '%'; }; }
+# hexdump (standalone package / BSD) A little faster than od (10-20%)
+#urlencode () { hexdump -v -e '/1 "x%02X"' | tr 'x' '%'; }
+
+# urlencoded --> raw
+# xdd - Very fast, just like encoding, but only works on 'pure' input
+rawurluncode () { tr '%' '\n' | xxd -r -p -c 1; }
+# bash echo - Slow and unreliable
+#urldecode () { escapebash | sed -e 's/%\([0-9A-F][0-9A-F]\)/\\x\1/gi;' | unescapebash; }
+
+# urlencoded/raw --> raw
+# Decode a mix of urlencoded and raw data (with spaces replaced by '+'); split into raw/encoded sections, selectively decode encoded sections, then rejoin
+urldecode () { tr "\n+" "\200\040" | sed 's/\(\(%[[:xdigit:]]\{2\}\)\+\)/\n\1\n/g;' | sed -un '2~2{ s/.*/echo -n "\0" | tr "%" "\n" | xxd -r -p -c 1 | tr "\n" "\x80"/e; }; p;' | tr -d "\n" | tr "\200" "\n"; }
+
+# raw --> urlencoded/raw
+# Encode only non-"word" characters [^a-zA-Z0-9_], and encode ' ' as '+'
+#urlencode () { tr "\n" "\177" | sed 's/[a-zA-Z0-9_ ]\+/\n\0\n/g;' | sed -un '1~2{ /./{ s/[^\o177]/\\\0/g; s/.*/echo -n \0 | tr "\o177" "\n" | xxd -p -c 1/e; s/.*/%\0/; s/\n/%/g; }; }; p;' | tr -d "\n" | tr "\040" "+"; }
+# Same as above, but also preserves forward slash (/) and dot (.)
+urlencode () { tr "\n" "\177" | sed "s/[a-zA-Z0-9_ ${1:-''}]\\+/\\n\\0\\n/g;" | sed -un '1~2{ /./{ s/\\/\\\\/; s/[^\o177]/\\\0/g; s/.*/echo -n \0 | tr "\o177" "\n" | xxd -p -c 1/e; s/.*/%\0/; s/\n/%/g; }; }; p;' | tr -d "\n" | tr "\040" "+"; }
+
+# Helper functions ###
+# urlencoded --(Strip control chars)--> urlencoded
+#urlencodestrip () { sed 's/%\([0-1][[:xdigit:]]\|FF\)//gi;'; }
+
+# HTML - Escape certain characters to avoid misinterpretation by browser ######
+# Sanitize input for use in HTML: & < > " ' (space)
+escapehtmlreserved () { sed -e 's/\&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/\x22/\&\#34;/g; s/\x27/\&\#39;/g; s/ /\&nbsp;/g;'; }
+# Escape whitespace for proper display in HTML (replace all with &nbsp; or &#32; as appropriate): (space)
+escapehtmlws () { sed -e 's/ /\&nbsp;/g; s/\x09/\&\#9;/g; s/$(echo -e "[\x0A\x0B\x0C\x0D]")/\&\#32;/g;'; }
+escapehtml () { escapehtmlreserved | escapehtmlws; }
+
+# Escape backslashes, spaces, *
+escapebash () { sed -e 's/\\/\\\\/g; s/\x09/\\t/g; s/\x0A/\\n/g; s/\x20/\\x20/g; s/\x2A/\\x2A/g;'; }
+# And, the reverse
+unescapebash () { echo -e "$(cat)"; }
+
+###############################################################################
+# Functions which will be handy for dealing with HTTP clients
+# sendheader RESPONSE-CODE CONTENT-TYPE
+sendheader () {
+	local CODE="$1"
+	if [ -z "$CODE" ]; then CODE="$R_200"; fi
+	local TYPE="$2"
+	if [ -z "$TYPE" ]; then TYPE="text/html"; fi
+	echo "HTTP/1.1 ${CODE}"
+	case "$HTTP_ENCODING" in
+		"gzip")
+			echo "Content-Encoding: gzip"
+			;;
+	esac
+	echo "Content-type: $TYPE"
+	echo "Connection: close"
+	echo "Date: $(date -R)"
+	echo "Server: $VERSIONi"
+	echo ""
+}
+
+# strip superfluous whitespace, compress if requested
+sendcontent () {
+	sendheader "$1" "$2"
+	case "$HTTP_ENCODING" in
+		"gzip")
+			gzip -cf
+			;;
+		*)
+			case "${2:-'text/html'}" in
+				"text/*")
+					sed -u '/\r$/!s/^.*$/\0\r/'  ;;
+				*)
+					cat ;;
+			esac
+			;;
+	esac
+}
+
+###############################################################################
+# Functions for parsing data from clients
+parserequest () {
+	local LINE=""; read LINE
+	local REQUEST_LINE=$(echo "$LINE" | sed -n -e 's/[[:space:]][[:space:]]*/\t/g; p;')
+	HTTP_METHOD=$(echo "$REQUEST_LINE" | cut -f 1)
+	HTTP_REQUEST_URI="$(readlink -m "$(echo "$REQUEST_LINE" | cut -f 2 | sed -e 's/^\([^?]*\)\(?.*\)\?$/\1/;' | urldecode)" | escapebash)"
+	HTTP_REQUEST_VARS="$(echo "$REQUEST_LINE" | cut -f 2 | sed -e 's/^[^?]*\(?\(.*\)\)\?$/\2/;' | sed -e 's/\&\&*/\&/g; s/^&//; s/\&$//; s/\&/\t/g; s/\(.*\)/\1/')"
+	HTTP_VERSION=$(echo "$REQUEST_LINE" | cut -f 3)
+}
+
+parseheader () {
+	local LINE=""; read LINE
+	local HEADER_LINE=$(echo "$LINE" | sed -nu -e '/^[[:space:]]*$/q; s/^\([^:]*\):[[:space:]][[:space:]]*\(.*\)$/\1\t\2/; p;')
+	# Catch the blank line that marks the end of headers
+	if [ -z "$HEADER_LINE" ]; then return 1; fi
+
+	local HEADER_FIELD=$(echo "$HEADER_LINE" | cut -f 1)
+	# Split up comma-delimited lists and assign them to $1-
+	local HEADER_DATA=$(echo "$HEADER_LINE" | cut -f 2 | sed -un -e 's/[[:space:]]*,[[:space:]]*/\t/g; s/\t\t*/\t/g; s/^\t//; s/\t$//; s/\(\t\?\)\([^\t]*\)\(\t\?\)/\1"\2"\3/g; p;')
+	set -- $HEADER_DATA
+
+	case "$HEADER_FIELD" in
+		"Accept")
+			:
+			;;
+	esac
+	return 0
+}
+
+###############################################################################
+# Functions for helping make HTML output
+html_start() {
+	echo '<?xml version="1.0" encoding="utf-8"?>'
+	echo '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">'
+	echo '<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">'	
+}
+
+head_start () {
+	echo '<head>'
+}
+
+head_title () {
+	echo '<title>'
+	echo "$1"
+	echo '</title>'
+}
+
+head_css () {
+	echo '<style type="text/css">'
+	echo "$1"
+	echo '</style>'
+}
+
+head_end () {
+	echo '</head>'
+}
+
+html_end() {
+	echo '</html>'
+}
+
+content_start () {
+	echo '<body>'
+}
+
+content_end () {
+	echo '</body>'
+}
+
+content_htmlify () {
+	sed -nu -e 's/$/<br \/>/;p'
+}
+
+list_directory () {
+	html_start
+	head_start
+	head_title "Index of $(echo -n "$1" | escapehtml)"
+	head_css 'a, a:active {text-decoration: none; color: blue;} a:visited {color: #48468F;} a:hover, a:focus {text-decoration: underline; color: red;} body {background-color: #F5F5F5;} h2 {margin-bottom: 12px;} table {margin-left: 12px;} th, td { font: 90% monospace; text-align: left;} th { font-weight: bold; padding-right: 14px; padding-bottom: 3px;} td {padding-right: 14px;} td.s, th.s {text-align: right;} div.list { background-color: white; border-top: 1px solid #646464; border-bottom: 1px solid #646464; padding-top: 10px; padding-bottom: 14px;} div.foot { font: 90% monospace; color: #787878; padding-top: 4px;}'
+	head_end
+	content_start
+	echo '<h2>'
+	echo "Index of $(echo -n "$1" | escapehtml)"
+	echo '</h2><div class="list"><table summary="Directory Listing" cellpadding="0" cellspacing="0"><thead><tr><th class="n">Name</th><th class="m">Last Modified</th><th class="s">Size</th><th class="t">Type</th></tr></thead><tbody>'
+	local line=""; local DIR="${DOCROOT}${1}"; ls -alLhpQ --group-directories-first --time-style="+%Y-%b-%d %T %Z" "$DIR" | sed -nu -e 's/\\/\\\\/g; 2,$p;;' | while read line; do
+		local filename="$(echo "$line" | sed -e 's/^[^"]*"\(.*\)"\(\/\?\)[^"]*$/\1\2/; s/\\"/"/g' | unescapebash)"
+		#echo $line "<br />" "$line" "<br />"
+		set -- $line
+		local filesize="$5"
+		local lastmod="$6 $7 $8"
+		echo "<tr><td class=\"n\"><a href=\"$(echo -n "$filename" | urlencode '/.')\">$(echo -n "$filename" | escapehtml)</a></td><td class=\"m\">$(echo -n "$lastmod" | escapehtml)</td><td class=\"s\">$(echo -n "$filesize" | escapehtml)</td><td class=\"t\">$(file -b --mime-type "${DIR}${filename}" | escapehtml)</td></tr>"
+	done
+	echo '</tbody></table></div><div class="foot">'
+	echo "$VERSION" | escapehtml
+	echo '</div>'
+	content_end
+	html_end
+}
+#set -r
+
+# Parse request and headers
+parserequest
+while parseheader; do :; done
+
+# Send out the HTTP response
+REALFILE="${DOCROOT}$(echo $HTTP_REQUEST_URI | unescapebash)"
+
+if [ ! -e "$REALFILE" ]; then
+	# Send 404 Not Found
+	echo $(html_start; head_start; head_title "404 ;_;"; head_end; content_start; echo "<div style=\"text-align: center; width: 100%;\"><span style=\"font-size: 300px;\">404</span><span style=\"font-size: 80px;\"><br />Not Found ;_;</span></div>"; content_end; html_end) | sendcontent "$R_404"
+elif [ ! -x "$REALFILE" ]; then
+	# Send 403 Forbidden
+	echo $(html_start; head_start; head_title "403 :|"; head_end; content_start; echo "<div style=\"text-align: center; width: 100%;\"><span style=\"font-size: 300px;\">403</span><span style=\"font-size: 80px;\"><br />Forbidden :|</span></div>"; content_end; html_end) | sendcontent "$R_403"
+else
+	if [ -d "$REALFILE" ]; then
+		REALFILE="$(readlink -m "$REALFILE")/" # Make sure we have the trailing slash
+		for index_file in "${REALFILE}index"{".sh",".php",".pl",".py",".htm",".html",""}; do
+			if [ -e "$index_file" -a -x "$index_file" ]; then REALFILE="$index_file"; break; fi
+		done
+	fi
+	if [ -d "$REALFILE" ]; then
+		# Check cache first
+		CACHEFILE="/tmp/bashttpd.$(echo -n "$REALFILE" | md5sum | head -c 32).$(date -r "$REALFILE" "+%s").cache"
+		if [ -e "$CACHEFILE" ]; then
+			cat $CACHEFILE
+		else
+			list_directory "$(readlink -m "$(echo "$HTTP_REQUEST_URI" | unescapebash)" | sed -e '/\/$/!{ s/.*/\0\//; }')" | tee "$CACHEFILE"
+		fi | sendcontent
+	else
+		# First, attempt to handle by extension, if unrecognized, use mimetype
+		EXTENSION=${REALFILE##*.}
+		case "$EXTENSION" in
+			"sh"|"shhtm"|"shhtml"|"bashtm"|"bashtm")
+				# HTML-generating bash script
+				bash "$REALFILE" $HTTP_REQUEST_VARS | sendcontent
+				;;
+			"htm"|"html")
+				# Static HTML
+				cat "$REALFILE" | sendcontent
+				;;
+			"php")
+				# PHP Script
+				php5-cgi -f "$REALFILE" -- $HTTP_REQUEST_VARS | sendcontent
+				;;
+			"phps")
+				# Pretty PHP Source
+				php5-cgi -s -f "$REALFILE" | sendcontent
+				;;
+			"pl")
+				# PHP Script
+				perl -- "$REALFILE" $HTTP_REQUEST_VARS | sendcontent
+				;;
+			"py")
+				# PHP Script
+				python "$REALFILE" $HTTP_REQUEST_VARS | sendcontent
+				;;
+			"txt"|"shs"|"pls"|"pys")
+				# Plain, unformatted text
+				cat "$REALFILE" | sendcontent "$R_200" "text/plain"
+				;;
+			*)
+				# Determine by mime type
+				MIMETYPE=$(file -b --mime-type "$REALFILE")
+				case "$MIMETYPE" in
+					"text/plain"|"text/html"|"image/"*)
+						# Dump contents to client
+						cat "$REALFILE" | sendcontent $R_200 $MIMETYPE
+						;;
+					*)
+						# Execute, assume output is HTML
+						"$REALFILE" $HTTP_REQUEST_VARS | sendcontent
+						;;
+				esac
+				;;
+		esac
+	fi
+fi
+
+exit 0

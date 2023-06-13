@@ -1,0 +1,434 @@
+#!/bin/bash
+# Usage:
+#   bashttpd -l [ -p PORT ] [ -r DOCROOT ]
+#     Begin listening for connections on PORT (default is 8080), fork new
+#     listener once connection is established.
+#   bashttpd [ -i ]
+#     Handle an HTTP connection, with request coming from stdin and response
+#     going to stdout.
+#   bashttpd -h
+#     Print this help text.
+
+declare -x BASHTTPD='1.0'
+declare -x BASHTTPD_VERSION="$(basename $0)/${BASHTTPD} bash/${BASH_VERSION} netcat/$(nc -h 2>&1 | sed -n -e '1s/^\[v\(.*\)\]$/\1/p')"
+declare -x BASHTTPD_ROOT
+# HTTP Response Codes
+declare -ar BASHTTPD_RESPONSE_CODE=(
+	[200]="OK :D"
+	[400]="Bad Request D:?"
+	[403]="Forbidden :|"
+	[404]="Not Found ;_;"
+)
+declare -ar BASHTTPD_CONTROL_CODES=( 'NUL' 'SOH' 'STX' 'ETX' 'EOT' 'ENQ' 'ACK' 'BEL' 'BS' 'HT' 'NL' 'VT' 'FF' 'CR' 'SO' 'SI' 'DLE' 'DC1' 'DC2' 'DC3' 'DC4' 'NAK' 'SYN' 'ETB' 'CAN' 'EM' 'SUB' 'ESC' 'FS' 'GS' 'RS' 'US' )
+# Parse options passed on command line
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-h|--help)
+			echo "Not yet implemented."
+			exit 0
+			;;
+		-l|--listen)
+			declare LISTEN=true
+			;;
+		-p|--port)
+			declare PORT="${2:?"Usage: -p|--port PORT"}"
+			shift
+			;;
+		-r|--root)
+			if ! BASHTTPD_ROOT="$(readlink -e "${2:?"Usage: -r|--root DOCROOT"}")"; then
+				echo "Directory not found: \"$2\"" >&2
+				exit 1
+			fi
+			shift
+			;;
+		*)
+			echo "Unknown parameter: \"$1\"" >&2
+			exit 1
+			;;
+	esac
+	shift
+done
+
+# LISTEN MODE
+if ${LISTEN:-false}; then
+	nc -v -l -p ${PORT:=8080} -e "$0" 2>&1 | while read line; do
+		if [[ $line == connect* ]]; then
+			"$0" -l -p $PORT &
+		elif [[ $line == Can* ]]; then
+			echo "Unable to bind to port $PORT" >&2
+			exit 1 
+		fi
+	done
+	exit 0
+fi
+
+# INTERACTIVE MODE
+declare -A BASHTTPD_REQUEST BASHTTPD_RESPONSE
+declare -a BASHTTPD_GETDATA BASHTTPD_POSTDATA
+
+# URL Rewriting
+#rewriteurl () { cat; }
+rewriteurl () {
+	cat;
+}
+
+###############################################################################
+# Stream filters... encoding, decoding, escaping, etc #########################
+###############################################################################
+
+# URLEncode - safe for use in URLs, understood by most web browsers ###########
+# raw --> urlencoded
+# rawurlencode () { od -v -A n -t x1 | tr -d '\n' | tr ' ' '%' }
+# rawurlencode () { hexdump -v -e '/1 "x%02X"' | tr 'x' '%'; }
+rawurlencode () { xxd -p -c 1 | { echo -n '%'; tr '\n' '%'; } | head -c -1; }
+
+# urlencoded --> raw
+# rawurldecode () { printf '%b' "$(sed -e 's/%/\\x/g;')"; }
+rawurldecode () { tr '%' '\n' | xxd -r -p -c 1; }
+
+# Partial URLEncode - only encodes [^\w ], and encodes ' ' as '+'
+# urlencoded/raw --> raw
+urldecode () { tr "\n+" "\200\040" | sed 's/\(\(%[[:xdigit:]]\{2\}\)\+\)/\n\1\n/g;' | sed -un '2~2{ s/.*/echo -n "\0" | tr "%" "\n" | xxd -r -p -c 1 | tr "\n" "\x80"/e; }; p;' | tr -d "\n" | tr "\200" "\n"; }
+# raw --> urlencoded/raw
+urlencode () { tr "\n" "\177" | sed "s/[a-zA-Z0-9_ ${1:-''}]\\+/\\n\\0\\n/g;" | sed -un '1~2{ /./{ s/\\/\\\\/; s/[^\o177]/\\\0/g; s/.*/echo -n \0 | tr "\o177" "\n" | xxd -p -c 1/e; s/.*/%\0/; s/\n/%/g; }; }; p;' | tr -d "\n" | tr "\040" "+"; }
+
+# HTML - Escape [&<>"' ] to avoid misinterpretation by browser ################
+# raw --> HTML-Escaped
+escapehtml () { sed -e 's/\x26/\&amp;/g; s/\x3c/\&lt;/g; s/\x3e/\&gt;/g; s/\x22/\&\#34;/g; s/\x27/\&\#39;/g; s/\x20/\&nbsp;/g;'; }
+
+# MD5 - Message digest / Hash #################################################
+# raw --> MD5(hex)
+md5hex () { openssl dgst -md5 -hex; }
+# raw --> MD5(base64)
+md5b64 () { openssl dgst -md5 -binary | base64; }
+
+# Misc Functions ##############################################################
+formatsize () { 
+	declare -a SIZEUNITS=( '' 'K' 'M' 'G' 'T' 'P' 'E' 'Z' 'Y' )
+	declare -a VALUES=( $(builtin printf 'a=%u; b=l(a)/l(1024); scale=0; b/=1; a/=1024^b; a; b;\n' "${1:-$(cat)}" | bc -l) )
+	builtin printf '%u%c' "${VALUES[0]}" "${SIZEUNITS[${VALUES[1]}]}"
+}
+
+# Bash - Stream filterized for laziness #######################################
+# raw --> Bash-Escaped
+escapebash () { builtin printf '%q' "${1:-"$(cat)"}"; }
+# Bash-Escaped --> raw
+unescapebash () { builtin printf '%b' "${1:-"$(cat)"}"; }
+
+# Extends printf to use the stream filters, though is several orders of magnitude slower
+# If no extended types are detected, bypasses transforming step for slightly faster operation
+# However, processor-intensive functions that do not need extended types should use 'builtin printf'
+# Otherwise, is backwards-compatible with the original printf, and can be used similarly
+# All extend the %s type, and support no options
+#	%H - HTML-Escaped string
+#	%U - URLEncoded string
+#	%p - URLEncoded path (same as %U, but keeps . and / as literal characters)
+#	%D - Decode a URLEncoded string
+#	%r - Raw URLEncoded string
+#	%R - Decoded Raw URLEncoded string
+#	%m - MD5 of string (hex)
+#	%M - MD5 of string (base64)
+#	%B - filesize in human-readable form (numeric input)
+function printf () {
+	declare ASSIGN
+	# Optional -v parameter
+	if [ "$1" == "-v" ]; then
+		ASSIGN="$2"
+		shift 2
+	fi
+	# Get a list of formats used
+	declare -a FIELDS=($(builtin printf '%s' "$1" | sed 's/[^%]*%\(.\)[^%]*/\1 /g; s/%//g;'))
+	# Replace the %s extensions with %s in the output format
+	declare FORMAT="$(builtin printf '%s' "$1" | sed 's/\(^\|[^%]*\)%[HUpDrRmMB]\([^%]\|%[^HUpDrRmMB]\)*/\1%s\2/g;')"
+	shift
+	# Get a list of values to use
+	declare -a VALUES=("$@")
+	# Only go through this mess if we're using one of the extended formats
+	if builtin printf '%s' "${FIELDS[*]}" | sed -n '/[HUpDrRmMB]/Q0; Q1;'; then
+		declare -i OFFSET=0
+		# Transform each value that is using an extended format type
+		while [ $OFFSET -lt ${#VALUES[@]} ]; do
+			for FIELD in "${FIELDS[@]}"; do
+				case "$FIELD" in
+					'H')
+						VALUES[$OFFSET]="$(builtin printf '%s' "${VALUES[$OFFSET]}" | escapehtml)" 
+						;;
+					'U')
+						VALUES[$OFFSET]="$(builtin printf '%s' "${VALUES[$OFFSET]}" | urlencode)" 
+						;;
+					'p')
+						VALUES[$OFFSET]="$(builtin printf '%s' "${VALUES[$OFFSET]}" | urlencode './')" 
+						;;
+					'D')
+						VALUES[$OFFSET]="$(builtin printf '%s' "${VALUES[$OFFSET]}" | urldecode)" 
+						;;
+					'r')
+						VALUES[$OFFSET]="$(builtin printf '%s' "${VALUES[$OFFSET]}" | rawurlencode)" 
+						;;
+					'R')
+						VALUES[$OFFSET]="$(builtin printf '%s' "${VALUES[$OFFSET]}" | rawurldecode)" 
+						;;
+					'm')
+						VALUES[$OFFSET]="$(builtin printf '%s' "${VALUES[$OFFSET]}" | md5hex)"
+						;;
+					'M')
+						VALUES[$OFFSET]="$(builtin printf '%s' "${VALUES[$OFFSET]}" | md5b64)"
+						;;
+					'B')
+						VALUES[$OFFSET]="$(formatsize "${VALUES[$OFFSET]}")"
+						;;
+				esac 
+				OFFSET+=1
+			done
+		done
+	fi
+	# Finally, call the original printf with our transformed values
+	if [ ! -z "$ASSIGN" ]; then
+		builtin printf -v "$ASSIGN" "$FORMAT" "${VALUES[@]}"
+		return $?
+	else
+		builtin printf "$FORMAT" "${VALUES[@]}"
+		return $?
+	fi
+}
+
+# Unbuffered printf, slower, but outputs partial results as soon as possible
+function uprintf () {
+	# Variable assignment is unsupported
+	if [ "$1" == '-v' ]; then
+		printf "$@"
+		return $?
+	fi
+	# Split format string (changed my mind, doing 1 format string at a time instead of 1 parameter at a time)
+	#declare -a FORMATS
+	#readarray FORMATS < <(builtin printf '%s' "$1" | sed 's/\(^\|[^%]*\)%[^%]\([^%]\|%%\)*/\0\n/g;')
+:
+	# Get number of parameters per format string
+	
+	
+}
+
+###############################################################################
+# Functions which will be handy for dealing with HTTP clients
+# Send headers, based on info currently in the BASHTTPD_RESPONSE array
+sendheader () {
+	# STATUS
+	printf '%s %u %s\n' "${BASHTTPD_RESPONSE['HTTP-Version']:='HTTP/1.1'}" "${BASHTTPD_RESPONSE['Status']:=200}" "${BASHTTPD_RESPONSE_CODE[${BASHTTPD_RESPONSE['Status']}]}"
+
+	# GENERAL HEADERS
+	printf 'Connection: close\n'
+	printf 'Date: %s\n' "$(date -R)"							# http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.18
+	#printf 'Transfer-Encoding: chunked'							# http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.41
+
+	# RESPONSE HEADERS
+	printf 'Accept-Ranges: %s\n' "${BASHTTPD_RESPONSE['Accept-Ranges']:-'none'}"		# http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.5
+	printf 'Age: %u\n' "${BASHTTPD_RESPONSE['Age']:-0}"					# http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.6
+	if [ ! -z ${BASHTTPD_RESPONSE['ETag']} ]; then
+		printf 'ETag: %s\n' "${BASHTTPD_RESPONSE['ETag']}"				# http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.19
+	fi
+	if [ ! -z ${BASHTTPD_RESPONSE['Location']} ]; then
+		printf 'Location: %s\n' "${BASHTTPD_RESPONSE['Location']}"			# http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.30
+	fi
+	if [ ! -z ${BASHTTPD_RESPONSE['Retry-After']} ]; then
+		printf 'Retry-After: %u\n' "${BASHTTPD_RESPONSE['Retry-After']}"		# http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.37
+	fi
+	printf 'Server: %s\n' "$BASHTTPD_VERSION"
+	#printf 'Vary: %s\n' ""									# http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.44
+
+	# ENTITY HEADERS
+	#printf 'Allow: GET'									# http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.7
+	if [ ! -z ${BASHTTPD_RESPONSE['Content-Encoding']} ]; then
+		printf 'Content-Encoding: %s\n' "${BASHTTPD_RESPONSE['Content-Encoding']}"	# http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.11
+	fi
+	if [ ! -z ${BASHTTPD_RESPONSE['Content-Length']} ]; then
+		printf 'Content-Length: %u\n' "${BASHTTPD_RESPONSE['Content-Length']}"		# http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.13
+	fi
+	if [ ! -z ${BASHTTPD_RESPONSE['Content-MD5']} ]; then
+		printf 'Content-MD5: %s\n' "${BASHTTPD_RESPONSE['Content-MD5']}"		# http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.15
+	fi
+	#printf 'Content-Range: %s %s/%s' 'bytes' '*' '*'					# http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.16
+	printf 'Content-Type: %s\n' "${BASHTTPD_RESPONSE['Content-Type']:-'text/plain'}"	# http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.17
+	printf 'Expires: %s\n' "${BASHTTPD_RESPONSE['Expires']:-"$(date -R)"}"			# http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.21
+	printf 'Last-Modified: %s\n' "${BASHTTPD_RESPONSE['Last-Modified']:-"$(date -R)"}"	# http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.29
+
+	# END OF HEADERS
+	printf '\n'
+}
+
+# Send headers and content from stdin
+sendcontent () {
+	sendheader
+	case "${BASHTTPD_RESPONSE['Content-Encoding']}" in
+		"gzip")
+			# Compress with gzip
+			gzip -cf
+			;;
+		*)
+			# Use advanced cat compression at max settings
+			cat
+			;;
+	esac
+}
+
+###############################################################################
+# Functions for generating HTML boilerplate
+html_start() {
+	printf '<?xml version="1.0" encoding="utf-8"?>'
+	printf '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">'
+	printf '<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">'	
+}
+head_start () {	printf '<head>'; }
+head_title () { printf '<title>%H</title>' "$1"; }
+head_css () { printf '<style type="text/css">%s</style>' "$1"; }
+head_end () { printf '</head>'; }
+html_end() { printf '</html>'; }
+content_start () { printf '<body>'; }
+content_end () { printf '</body>'; }
+
+###############################################################################
+# Functions for parsing data from clients
+parserequest () {
+	declare LINE
+	if read -r -t 30 LINE; then
+		BASHTTPD_REQUEST['Method']="$(printf "$LINE" | cut -d ' ' -f 1)"
+		BASHTTPD_REQUEST['Request-URI']="$(printf "$LINE" | cut -d ' ' -f 2)"
+		BASHTTPD_REQUEST['HTTP-Version']="$(printf "$LINE" | cut -d ' ' -f 3)"
+		#HTTP_REQUEST_URI="$(readlink -m "$(echo "$REQUEST_LINE" | cut -f 2 | sed -e 's/^\([^?]*\)\(?.*\)\?$/\1/;' | urldecode)" | escapebash)"
+		#HTTP_REQUEST_VARS="$(echo "$REQUEST_LINE" | cut -f 2 | sed -e 's/^[^?]*\(?\(.*\)\)\?$/\2/;' | sed -e 's/\&\&*/\&/g; s/^&//; s/\&$//; s/\&/\t/g; s/\(.*\)/\1/')"
+	else
+		return 1
+	fi
+
+	declare FIELD VALUE
+	while read -r -t 30 LINE && [ ! -z "$(printf "$LINE" | tr -d '[:space:]')" ]; do
+		FIELD="$(printf "$LINE" | sed -n 's/^\([^:]*\).*$/\1/p;')"
+		VALUE="$(printf "$LINE" | sed -n '/^[^:]*:/{ s/^[^:]*:[[:space:]]*\(.*\)$/"\1/; s/^[^:]*:\(.*\)$/\1/; s/[[:space:]]*,[[:space:]]*/" "/g; s/^[[:space:]]*/"/; s/[[:space:]]*$/"/; s/[[:space:]]*""[[:space:]]*/ /g; s/   */ /g; s/^ *//; s/ *$//; p; }')"
+		BASHTTPD_REQUEST["$FIELD"]="$VALUE"
+	done
+}
+
+###############################################################################
+# Look over the request headers and decide on what response headers to send
+negotiatesettings () {
+	set -- $(printf '%s' "${BASHTTPD_REQUEST['Request-URI']}" | sed 's/\(http:\/\/\)\?\([^?/:]*\(:\([[:digit:]]\+\)\)\?\)\(\/[^?]*\)\?\(?\(.*\)\)\?$/\1 \2 \3 \4 \5 \6 \7/;')
+	# If the Request-URI contains an absolute path (including a host), any other Host header value is ignored.
+	if [ ! -z $2 ]; then BASHTTPD_REQUEST['Host']="$2"; fi
+	if [ "${BASHTTPD_REQUEST['HTTP-Version']:='HTTP/1.0'}" = 'HTTP/1.1' -a -z ${BASHTTPD_REQUEST['Host']} ]; then
+		BASHTTPD_RESPONSE['Status']=400
+		errordoc | sendcontent
+		exit 0
+	else
+		BASHTTPD_REQUEST['Host-Port']="${4:-80}"
+		BASHTTPD_REQUEST['Real-Path']="${5:-'/'}"
+		printf 'http://%s%s%s' "${BASHTTPD_REQUEST['Host']:-'localhost'}" ""
+		BASHTTPD_GETDATA=$(printf "$7" | sed 's/\&\&*/\&/g; s/^\&//; s/\&$//; s/\&/ /g;')
+	fi
+}
+
+###############################################################################
+
+list_directory () {
+	html_start
+	head_start
+	head_title "Index of $(echo -n "$1" | escapehtml)"
+	head_css 'a, a:active {text-decoration: none; color: blue;} a:visited {color: #48468F;} a:hover, a:focus {text-decoration: underline; color: red;} body {background-color: #F5F5F5;} h2 {margin-bottom: 12px;} table {margin-left: 12px;} th, td { font: 90% monospace; text-align: left;} th { font-weight: bold; padding-right: 14px; padding-bottom: 3px;} td {padding-right: 14px;} td.s, th.s {text-align: right;} div.list { background-color: white; border-top: 1px solid #646464; border-bottom: 1px solid #646464; padding-top: 10px; padding-bottom: 14px;} div.foot { font: 90% monospace; color: #787878; padding-top: 4px;}'
+	head_end
+	content_start
+	echo '<h2>'
+	echo "Index of $(echo -n "$1" | escapehtml)"
+	echo '</h2><div class="list"><table summary="Directory Listing" cellpadding="0" cellspacing="0"><thead><tr><th class="n">Name</th><th class="m">Last Modified</th><th class="s">Size</th><th class="t">Type</th></tr></thead><tbody>'
+	local line=""; local DIR="${DOCROOT}${1}"; ls -alLhpQ --group-directories-first --time-style="+%Y-%b-%d %T %Z" "$DIR" | sed -nu -e 's/\\/\\\\/g; 2,$p;;' | while read line; do
+		local filename="$(echo "$line" | sed -e 's/^[^"]*"\(.*\)"\(\/\?\)[^"]*$/\1\2/; s/\\"/"/g' | unescapebash)"
+		#echo $line "<br />" "$line" "<br />"
+		set -- $line
+		local filesize="$5"
+		local lastmod="$6 $7 $8"
+		echo "<tr><td class=\"n\"><a href=\"$(echo -n "$filename" | urlencode '/.')\">$(echo -n "$filename" | escapehtml)</a></td><td class=\"m\">$(echo -n "$lastmod" | escapehtml)</td><td class=\"s\">$(echo -n "$filesize" | escapehtml)</td><td class=\"t\">$(file -b --mime-type "${DIR}${filename}" | escapehtml)</td></tr>"
+	done
+	echo '</tbody></table></div><div class="foot">'
+	echo "$VERSION" | escapehtml
+	echo '</div>'
+	content_end
+	html_end
+}
+#set -r
+
+# Parse request and headers
+parserequest
+while parseheader; do :; done
+
+# Send out the HTTP response
+REALFILE="${DOCROOT}$(echo $HTTP_REQUEST_URI | unescapebash)"
+
+if [ ! -e "$REALFILE" ]; then
+	# Send 404 Not Found
+	echo $(html_start; head_start; head_title "404 ;_;"; head_end; content_start; echo "<div style=\"text-align: center; width: 100%;\"><span style=\"font-size: 300px;\">404</span><span style=\"font-size: 80px;\"><br />Not Found ;_;</span></div>"; content_end; html_end) | sendcontent "$R_404"
+elif [ ! -x "$REALFILE" ]; then
+	# Send 403 Forbidden
+	echo $(html_start; head_start; head_title "403 :|"; head_end; content_start; echo "<div style=\"text-align: center; width: 100%;\"><span style=\"font-size: 300px;\">403</span><span style=\"font-size: 80px;\"><br />Forbidden :|</span></div>"; content_end; html_end) | sendcontent "$R_403"
+else
+	if [ -d "$REALFILE" ]; then
+		REALFILE="$(readlink -m "$REALFILE")/" # Make sure we have the trailing slash
+		for index_file in "${REALFILE}index"{".sh",".php",".pl",".py",".htm",".html",""}; do
+			if [ -e "$index_file" -a -x "$index_file" ]; then REALFILE="$index_file"; break; fi
+		done
+	fi
+	if [ -d "$REALFILE" ]; then
+		# Check cache first
+		CACHEFILE="/tmp/bashttpd.$(echo -n "$REALFILE" | md5sum | head -c 32).$(date -r "$REALFILE" "+%s").cache"
+		if [ -e "$CACHEFILE" ]; then
+			cat $CACHEFILE
+		else
+			list_directory "$(readlink -m "$(echo "$HTTP_REQUEST_URI" | unescapebash)" | sed -e 's/\([^/]\)$/\1\//')" | tee "$CACHEFILE"
+		fi | sendcontent
+	else
+		# First, attempt to handle by extension, if unrecognized, use mimetype
+		EXTENSION=${REALFILE##*.}
+		case "$EXTENSION" in
+			"sh"|"shhtm"|"shhtml"|"bashtm"|"bashtm")
+				# HTML-generating bash script
+				bash "$REALFILE" $HTTP_REQUEST_VARS | sendcontent
+				;;
+			"htm"|"html")
+				# Static HTML
+				cat "$REALFILE" | sendcontent
+				;;
+			"php")
+				# PHP Script
+				php5-cgi -- $HTTP_REQUEST_VARS <"$REALFILE" | sendcontent
+				;;
+			"phps")
+				# Pretty PHP Source
+				php5-cgi -s -f "$REALFILE" | sendcontent
+				;;
+			"pl")
+				# PHP Script
+				perl -- "$REALFILE" $HTTP_REQUEST_VARS | sendcontent
+				;;
+			"py")
+				# PHP Script
+				python "$REALFILE" $HTTP_REQUEST_VARS | sendcontent
+				;;
+			"txt"|"shs"|"pls"|"pys")
+				# Plain, unformatted text
+				cat "$REALFILE" | sendcontent "$R_200" "text/plain"
+				;;
+			*)
+				# Determine by mime type
+				MIMETYPE=$(file -b --mime-type "$REALFILE")
+				case "$MIMETYPE" in
+					"text/plain"|"text/html"|"image/"*)
+						# Dump contents to client
+						cat "$REALFILE" | sendcontent $R_200 $MIMETYPE
+						;;
+					*)
+						# Execute, assume output is HTML
+						"$REALFILE" $HTTP_REQUEST_VARS | sendcontent
+						;;
+				esac
+				;;
+		esac
+	fi
+fi
+
+exit 0
